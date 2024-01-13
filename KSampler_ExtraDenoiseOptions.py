@@ -25,3 +25,13 @@ class KSampler_ExtraDenoiseOptions:
     def sample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0):
         return common_ksampler_extra_denoise(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=denoise)
 
+# A dictionary that contains all nodes you want to export with their names
+# NOTE: names should be globally unique
+NODE_CLASS_MAPPINGS = {
+    "KSampler_ExtraDenoiseOptions": KSampler_ExtraDenoiseOptions
+}
+
+# A dictionary that contains the friendly/humanly readable titles for the nodes
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "KSampler_ExtraDenoiseOptions": "KSampler_ExtraDenoiseOptions Node"
+}
