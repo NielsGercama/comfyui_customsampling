@@ -1,60 +1,167 @@
 import torch
 from tqdm import trange
+import os, sys
 
-def append_zero(x):
-    return torch.cat([x, x.new_zeros([1])])
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
-def append_dims(x, target_dims):
-    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
-    dims_to_append = target_dims - x.ndim
-    if dims_to_append < 0:
-        raise ValueError(f'input has {x.ndim} dims but target_dims is {target_dims}, which is less')
-    expanded = x[(...,) + (None,) * dims_to_append]
-    # MPS will get inf values if it tries to index into the new axes, but detaching fixes this.
-    # https://github.com/pytorch/pytorch/issues/84364
-    return expanded.detach().clone() if expanded.device.type == 'mps' else expanded
+import comfy.sample
+from comfy.sampler import Sampler, KSamplerX0Inpaint, calculate_sigmas_scheduler, sampler_object
+import latent_preview
+from .k_diffusion import sampling as k_diffusion_sampling
+
+SCHEDULER_NAMES = ["karras"]
+SAMPLER_NAMES = ["dpm_2"]
+
+def common_ksampler_extra_denoise(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
+    latent_image = latent["samples"]
+    if disable_noise:
+        noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+    else:
+        batch_inds = latent["batch_index"] if "batch_index" in latent else None
+        noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+
+    noise_mask = None
+    if "noise_mask" in latent:
+        noise_mask = latent["noise_mask"]
+
+    callback = latent_preview.prepare_callback(model, steps)
+    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    samples = sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+                                denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
+                                force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
+    out = latent.copy()
+    out["samples"] = samples
+    return (out, )
+
+def sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False, noise_mask=None, sigmas=None, callback=None, disable_pbar=False, seed=None):
+    real_model, positive_copy, negative_copy, noise_mask, models = comfy.sample.prepare_sampling(model, noise.shape, positive, negative, noise_mask)
+
+    noise = noise.to(model.load_device)
+    latent_image = latent_image.to(model.load_device)
+
+    sampler = KSampler(real_model, steps=steps, device=model.load_device, sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
+
+    samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image, start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise, denoise_mask=noise_mask, sigmas=sigmas, callback=callback, disable_pbar=disable_pbar, seed=seed)
+    samples = samples.to(comfy.model_management.intermediate_device())
+
+    comfy.sample.cleanup_additional_models(models)
+    comfy.sample.cleanup_additional_models(set(comfy.sample.get_models_from_cond(positive_copy, "control") + comfy.sample.get_models_from_cond(negative_copy, "control")))
+    return samples
 
 
-def to_d(x, sigma, denoised):
-    """Converts a denoiser output to a Karras ODE derivative."""
-    return (x - denoised) / append_dims(sigma, x.ndim)
 
-def get_sigmas_karras(n, sigma_min, sigma_max, rho=7., device='cpu'):
-    """Constructs the noise schedule of Karras et al. (2022)."""
-    ramp = torch.linspace(0, 1, n, device=device)
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-    return append_zero(sigmas).to(device)
+class KSAMPLER(Sampler):
+    def __init__(self, sampler_function, extra_options={}, inpaint_options={}):
+        self.sampler_function = sampler_function
+        self.extra_options = extra_options
+        self.inpaint_options = inpaint_options
 
-
-
-@torch.no_grad()
-def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
-    """A sampler inspired by DPM-Solver-2 and Algorithm 2 from Karras et al. (2022)."""
-    extra_args = {} if extra_args is None else extra_args
-    s_in = x.new_ones([x.shape[0]])
-    for i in trange(len(sigmas) - 1, disable=disable):
-        gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-        sigma_hat = sigmas[i] * (gamma + 1)
-        if gamma > 0:
-            eps = torch.randn_like(x) * s_noise
-            x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
-        denoised = model(x, sigma_hat * s_in, **extra_args)
-        d = to_d(x, sigma_hat, denoised)
-        if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
-        if sigmas[i + 1] == 0:
-            # Euler method
-            dt = sigmas[i + 1] - sigma_hat
-            x = x + d * dt
+    def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
+        extra_args["denoise_mask"] = denoise_mask
+        model_k = KSamplerX0Inpaint(model_wrap)
+        model_k.latent_image = latent_image
+        if self.inpaint_options.get("random", False): #TODO: Should this be the default?
+            generator = torch.manual_seed(extra_args.get("seed", 41) + 1)
+            model_k.noise = torch.randn(noise.shape, generator=generator, device="cpu").to(noise.dtype).to(noise.device)
         else:
-            # DPM-Solver-2
-            sigma_mid = sigma_hat.log().lerp(sigmas[i + 1].log(), 0.5).exp()
-            dt_1 = sigma_mid - sigma_hat
-            dt_2 = sigmas[i + 1] - sigma_hat
-            x_2 = x + d * dt_1
-            denoised_2 = model(x_2, sigma_mid * s_in, **extra_args)
-            d_2 = to_d(x_2, sigma_mid, denoised_2)
-            x = x + d_2 * dt_2
-    return x
+            model_k.noise = noise
+
+        if self.max_denoise(model_wrap, sigmas):
+            noise = noise * torch.sqrt(1.0 + sigmas[0] ** 2.0)
+        else:
+            noise = noise * sigmas[0]
+
+        k_callback = None
+        total_steps = len(sigmas) - 1
+        if callback is not None:
+            k_callback = lambda x: callback(x["i"], x["denoised"], x["x"], total_steps)
+
+        if latent_image is not None:
+            noise += latent_image
+
+        samples = self.sampler_function(model_k, noise, sigmas, extra_args=extra_args, callback=k_callback, disable=disable_pbar, **self.extra_options)
+        return samples
+
+
+class KSampler:
+    SCHEDULERS = SCHEDULER_NAMES
+    SAMPLERS = SAMPLER_NAMES
+
+    def __init__(self, model, steps, device, sampler=None, scheduler=None, denoise=None, model_options={}):
+        self.model = model
+        self.device = device
+        if scheduler not in self.SCHEDULERS:
+            scheduler = self.SCHEDULERS[0]
+        if sampler not in self.SAMPLERS:
+            sampler = self.SAMPLERS[0]
+        self.scheduler = scheduler
+        self.sampler = sampler
+        self.set_steps(steps, denoise)
+        self.denoise = denoise
+        self.model_options = model_options
+
+    def calculate_sigmas(self, steps):
+        sigmas = None
+
+        discard_penultimate_sigma = False
+        if self.sampler in ['dpm_2', 'dpm_2_ancestral', 'uni_pc', 'uni_pc_bh2']:
+            steps += 1
+            discard_penultimate_sigma = True
+
+        sigmas = calculate_sigmas_scheduler(self.model, self.scheduler, steps)
+
+        if discard_penultimate_sigma:
+            sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])
+        return sigmas
+
+    def set_steps(self, steps, denoise=None):
+        self.steps = steps
+        if denoise is None or denoise > 0.9999:
+            self.sigmas = self.calculate_sigmas(steps).to(self.device)
+        else:
+            new_steps = int(steps/denoise)
+            sigmas = self.calculate_sigmas(new_steps).to(self.device)
+            self.sigmas = sigmas[-(steps + 1):]
+
+    def sample(self, noise, positive, negative, cfg, latent_image=None, start_step=None, last_step=None, force_full_denoise=False, denoise_mask=None, sigmas=None, callback=None, disable_pbar=False, seed=None):
+        if sigmas is None:
+            sigmas = self.sigmas
+
+        if last_step is not None and last_step < (len(sigmas) - 1):
+            sigmas = sigmas[:last_step + 1]
+            if force_full_denoise:
+                sigmas[-1] = 0
+
+        if start_step is not None:
+            if start_step < (len(sigmas) - 1):
+                sigmas = sigmas[start_step:]
+            else:
+                if latent_image is not None:
+                    return latent_image
+                else:
+                    return torch.zeros_like(noise)
+
+        sampler = sampler_object(self.sampler)
+
+        return sample(self.model, noise, positive, negative, cfg, self.device, sampler, sigmas, self.model_options, latent_image=latent_image, denoise_mask=denoise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
+    
+def ksampler(sampler_name, extra_options={}, inpaint_options={}):
+    if sampler_name == "dpm_fast":
+        def dpm_fast_function(model, noise, sigmas, extra_args, callback, disable):
+            sigma_min = sigmas[-1]
+            if sigma_min == 0:
+                sigma_min = sigmas[-2]
+            total_steps = len(sigmas) - 1
+            return k_diffusion_sampling.sample_dpm_fast(model, noise, sigma_min, sigmas[0], total_steps, extra_args=extra_args, callback=callback, disable=disable)
+        sampler_function = dpm_fast_function
+    elif sampler_name == "dpm_adaptive":
+        def dpm_adaptive_function(model, noise, sigmas, extra_args, callback, disable):
+            sigma_min = sigmas[-1]
+            if sigma_min == 0:
+                sigma_min = sigmas[-2]
+            return k_diffusion_sampling.sample_dpm_adaptive(model, noise, sigma_min, sigmas[0], extra_args=extra_args, callback=callback, disable=disable)
+        sampler_function = dpm_adaptive_function
+    else:
+        sampler_function = getattr(k_diffusion_sampling, "sample_{}".format(sampler_name))
+
+    return KSAMPLER(sampler_function, extra_options, inpaint_options)
